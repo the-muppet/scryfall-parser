@@ -20,21 +20,21 @@ struct ScryfallCard {
     card_faces: Option<Vec<CardFace>>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone, Serialize)]
 struct CardFace {
     name: String,
     #[serde(default)]
     image_uris: Option<ImageUris>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone, Serialize)]
 struct ImageUris {
     small: String,
     normal: String,
     large: String,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone, Serialize)]
 struct Prices {
     usd: Option<String>,
     usd_foil: Option<String>,
