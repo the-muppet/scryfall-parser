@@ -280,7 +280,16 @@ table.sort(unique_candidates, function(a, b) return a.score > b.score end)
 for _, candidate in ipairs(unique_candidates) do
     if #results >= max_results then break end
     
-    local card_data = redis.call('GET', 'card:' .. candidate.uuid)
+    local card_data = redis.call('JSON.GET', 'mtg:cards:data:' .. candidate.uuid, '$')
+    if card_data and card_data ~= cjson.null then
+        -- JSON.GET returns array, extract first element
+        local parsed = cjson.decode(card_data)
+        if parsed and #parsed > 0 then
+            card_data = cjson.encode(parsed[1])
+        else
+            card_data = nil
+        end
+    end
     if card_data then
         local card = cjson.decode(card_data)
         

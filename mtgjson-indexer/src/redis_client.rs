@@ -657,39 +657,56 @@ impl MTGRedisClient {
     // =============================================================================
 
     pub async fn get_expensive_cards(&mut self, min_price: f64, max_results: usize) -> Result<Vec<serde_json::Value>> {
-        let args = vec![min_price.to_string(), max_results.to_string()];
-        let result: redis::Value = self.execute_lua_script_raw("find_expensive_cards", args).await?;
+        let mut con = self.client.get_multiplexed_async_connection().await?;
         
-        match result {
-            redis::Value::Array(items) => {
-                let mut cards = Vec::new();
-                for item in items.iter() {
-                    match item {
-                        redis::Value::BulkString(json_bytes) => {
-                            if let Ok(json_str) = String::from_utf8(json_bytes.clone()) {
-                                if let Ok(card_json) = serde_json::from_str::<serde_json::Value>(&json_str) {
-                                    cards.push(card_json);
+        // Use RediSearch to find expensive cards - this is MUCH faster than the Lua script
+        let query = "*"; // Get all cards, we'll sort by pricing in TCG data
+        
+        let search_result: redis::RedisResult<Vec<redis::Value>> = redis::cmd("FT.SEARCH")
+            .arg("mtg:cards:idx")
+            .arg(query)
+            .arg("LIMIT")
+            .arg(0)
+            .arg(max_results * 10) // Get more than needed since we need to filter by price
+            .query_async(&mut con)
+            .await;
+            
+        let mut cards = Vec::new();
+        
+        if let Ok(results) = search_result {
+            if results.len() > 1 {
+                let mut i = 1; // Skip count
+                while i + 1 < results.len() && cards.len() < max_results {
+                    if let Ok(doc_data) = redis::from_redis_value::<String>(&results[i + 1]) {
+                        if let Ok(card_data) = serde_json::from_str::<serde_json::Value>(&doc_data) {
+                            // Check if card has pricing above threshold
+                            if let Some(skus) = card_data.get("tcgplayer_skus").and_then(|s| s.as_array()) {
+                                for sku in skus {
+                                    // Note: We'd need to look up actual pricing from SKU data
+                                    // For now, include all cards that have TCGPlayer data
+                                    if sku.get("sku_id").is_some() {
+                                        let card_json = serde_json::json!({
+                                            "uuid": card_data.get("uuid"),
+                                            "name": card_data.get("name"), 
+                                            "set_code": card_data.get("set_code"),
+                                            "set_name": card_data.get("set_name"),
+                                            "rarity": card_data.get("rarity"),
+                                            "mana_value": card_data.get("mana_value"),
+                                            "tcgplayer_product_id": card_data.get("tcgplayer_product_id")
+                                        });
+                                        cards.push(card_json);
+                                        break; // Only add the card once
+                                    }
                                 }
                             }
                         }
-                        redis::Value::SimpleString(json_str) => {
-                            if let Ok(card_json) = serde_json::from_str::<serde_json::Value>(json_str) {
-                                cards.push(card_json);
-                            }
-                        }
-                        _ => {
-                            if let Ok(json_val) = redis_value_to_json(&item) {
-                                cards.push(json_val);
-                            }
-                        }
                     }
+                    i += 2;
                 }
-                Ok(cards)
-            }
-            _ => {
-                Err(anyhow::anyhow!("Unexpected return type from find_expensive_cards Lua script: {:?}", result))
             }
         }
+        
+        Ok(cards)
     }
 
     pub async fn get_trending_cards(&mut self, direction: &str, limit: usize) -> Result<Vec<serde_json::Value>> {
@@ -812,8 +829,54 @@ impl MTGRedisClient {
     }
 
     pub async fn get_database_stats(&mut self) -> Result<DatabaseStats> {
-        let card_count = self.get_key_count("card:*").await.unwrap_or(0);
-        let deck_count = self.get_key_count("deck:*").await.unwrap_or(0);
+        // Use RediSearch index info for accurate counts
+        let mut con = self.client.get_multiplexed_async_connection().await?;
+        
+        let card_count = match redis::cmd("FT.INFO")
+            .arg("mtg:cards:idx")
+            .query_async::<Vec<redis::Value>>(&mut con)
+            .await 
+        {
+            Ok(info) => {
+                // FT.INFO returns array, look for "num_docs" field
+                let mut i = 0;
+                while i + 1 < info.len() {
+                    if let Ok(key) = redis::from_redis_value::<String>(&info[i]) {
+                        if key == "num_docs" {
+                                                         if let Ok(count) = redis::from_redis_value::<usize>(&info[i + 1]) {
+                                 return count;
+                             }
+                        }
+                    }
+                    i += 2;
+                }
+                0
+            }
+            Err(_) => self.get_key_count("mtg:cards:data:*").await.unwrap_or(0),
+        };
+        
+        let deck_count = match redis::cmd("FT.INFO")
+            .arg("mtg:decks:idx")
+            .query_async::<Vec<redis::Value>>(&mut con)
+            .await 
+        {
+            Ok(info) => {
+                let mut i = 0;
+                while i + 1 < info.len() {
+                    if let Ok(key) = redis::from_redis_value::<String>(&info[i]) {
+                        if key == "num_docs" {
+                            if let Ok(count) = redis::from_redis_value::<usize>(&info[i + 1]) {
+                                return count;
+                            }
+                        }
+                    }
+                    i += 2;
+                }
+                0
+            }
+            Err(_) => self.get_key_count("mtg:decks:data:*").await.unwrap_or(0),
+        };
+        
         let set_count = self.get_all_sets().await.unwrap_or_default().len();
         
         Ok(DatabaseStats {

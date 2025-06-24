@@ -24,9 +24,16 @@ repeat
                     local uuid = string.match(key, "price:([^:]+):")
                     
                     if uuid then
-                        -- Get card details from card:UUID
-                        local card_key = "card:" .. uuid
-                        local card_data = redis.call("GET", card_key)
+                                -- Get card details from RediSearch JSON document
+        local card_key = "mtg:cards:data:" .. uuid
+                        local card_data_raw = redis.call("JSON.GET", card_key, "$")
+        local card_data = nil
+        if card_data_raw and card_data_raw ~= cjson.null then
+            local parsed = cjson.decode(card_data_raw)
+            if parsed and #parsed > 0 then
+                card_data = cjson.encode(parsed[1])
+            end
+        end
                         if card_data then
                             -- Extract card name from JSON
                             local name_match = string.match(card_data, '"name":%s*"([^"]+)"')
