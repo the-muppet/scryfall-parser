@@ -55,22 +55,22 @@ until cursor == "0"
 -- Sort by price (descending)
 table.sort(expensive_cards, function(a, b) return a.price > b.price end)
 
--- Format results
-local results = {"=== EXPENSIVE CARDS (>= $" .. min_price .. ") ===", ""}
+-- Return JSON array 
+local json_results = {}
 
 for i = 1, math.min(max_results, #expensive_cards) do
     local card = expensive_cards[i]
-    local price_str = string.format("$%.2f", card.price)
-    results[#results + 1] = string.format("%2d. %-25s %8s %-12s [%s]", 
-                                          i, card.name, price_str, card.condition, card.set)
+    local result_entry = cjson.encode({
+        uuid = card.uuid,
+        name = card.name,
+        price = card.price,
+        condition = card.condition,
+        set_code = card.set,
+        rank = i,
+        min_price_threshold = min_price,
+        total_found = #expensive_cards
+    })
+    table.insert(json_results, result_entry)
 end
 
-if #expensive_cards == 0 then
-    results[#results + 1] = "No cards found above $" .. min_price
-else
-    results[#results + 1] = ""
-    results[#results + 1] = "Total found: " .. #expensive_cards .. " cards"
-    results[#results + 1] = "Note: Multiple entries per card are for different conditions/printings"
-end
-
-return results 
+return json_results 

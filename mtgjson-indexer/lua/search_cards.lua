@@ -284,8 +284,8 @@ for _, candidate in ipairs(unique_candidates) do
         local card = cjson.decode(card_data)
         
         if apply_filters(card) then
-            -- Build result entry
-            local result_entry = {
+            -- Build result entry as JSON string
+            local result_entry = cjson.encode({
                 uuid = candidate.uuid,
                 name = card.name,
                 set_code = card.set_code,
@@ -306,7 +306,7 @@ for _, candidate in ipairs(unique_candidates) do
                 is_promo = card.is_promo,
                 tcgplayer_product_id = card.tcgplayer_product_id or "",
                 score = candidate.score
-            }
+            })
             
             table.insert(results, result_entry)
         end
