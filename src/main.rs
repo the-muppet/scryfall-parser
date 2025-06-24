@@ -8,108 +8,244 @@ use std::time::Instant;
 use chrono::Utc;
 
 const BATCH_SIZE: usize = 2000;     
-const CHUNK_SIZE: usize = 10000;
+const CHUNK_SIZE: usize = 8000;  // Reduced for larger all_cards dataset
 const MAX_PREFIX_LENGTH: usize = 30;
 const NGRAM_SIZE: usize = 3; 
 
 #[derive(Deserialize, Debug, Clone)]
-struct ScryfallCard {
-    id: String,
+pub struct ScryfallCard {
+    pub id: String,
     #[serde(default)]
-    oracle_id: Option<String>,
-    name: String,
+    pub oracle_id: Option<String>,
+    pub name: String,
     #[serde(default)]
-    layout: String,
-    set: String,
-    set_name: String,
-    collector_number: String,
+    pub layout: String,
+    pub set: String,
+    pub set_name: String,
+    pub collector_number: String,
     #[serde(default)]
-    tcgplayer_id: Option<i64>,
+    pub tcgplayer_id: Option<i64>,
     #[serde(default)]
-    prices: Option<Prices>,
+    pub prices: Option<Prices>,
     #[serde(default)]
-    image_uris: Option<ImageUris>,
+    pub image_uris: Option<ImageUris>,
     #[serde(default)]
-    card_faces: Option<Vec<CardFace>>,
+    pub card_faces: Option<Vec<CardFace>>,
     #[serde(default)]
-    released_at: Option<String>,
+    pub released_at: Option<String>,
     #[serde(default)]
-    rarity: Option<String>,
+    pub rarity: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Clone, Serialize, Default)]
-struct CardFace {
-    name: String,
+pub struct CardFace {
+    pub name: String,
     #[serde(default)]
-    image_uris: Option<ImageUris>,
+    pub image_uris: Option<ImageUris>,
 }
 
 #[derive(Deserialize, Debug, Clone, Serialize, Default)]
-struct ImageUris {
+pub struct ImageUris {
     #[serde(default)]
-    small: String,
+    pub small: String,
     #[serde(default)]
-    normal: String,
+    pub normal: String,
     #[serde(default)]
-    large: String,
+    pub large: String,
 }
 
 #[derive(Deserialize, Debug, Clone, Serialize, Default)]
-struct Prices {
+pub struct Prices {
     #[serde(default)]
-    usd: Option<String>,
+    pub usd: Option<String>,
     #[serde(default)]
-    usd_foil: Option<String>,
+    pub usd_foil: Option<String>,
     #[serde(default)]
-    eur: Option<String>,
+    pub eur: Option<String>,
 }
-
 
 #[derive(Default)]
-struct SearchIndexes {
-    ngrams: HashMap<String, HashSet<String>>,
-    metaphones: HashMap<String, HashSet<String>>,
-    words: HashMap<String, HashSet<String>>,
+pub struct SearchIndexes {
+    pub ngrams: HashMap<String, HashSet<String>>,
+    pub metaphones: HashMap<String, HashSet<String>>,
+    pub words: HashMap<String, HashSet<String>>,
 }
 
-#[derive(Serialize, Debug)]
-struct IndexedCard {
-    id: String,
-    oracle_id: String,
-    name: String,
-    sets: Vec<String>,      
-    layout: String,
-    tcgplayer_ids: Vec<i64>,
-    main_image: Option<String>,
-    prices: Vec<PrintingPrice>,
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct IndexedCard {
+    pub id: String,
+    pub oracle_id: String,
+    pub name: String,
+    pub sets: Vec<String>,      
+    pub layout: String,
+    pub tcgplayer_ids: Vec<i64>,
+    pub main_image: Option<String>,
+    pub prices: Vec<PrintingPrice>,
 }
 
-#[derive(Serialize, Debug)]
-struct PrintingPrice {
-    set: String, 
-    set_name: Option<String>,
-    collector_number: String,
-    tcgplayer_id: Option<i64>,
-    prices: Prices,
-    released_at: Option<String>,
-    rarity: Option<String>,
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PrintingPrice {
+    pub set: String, 
+    pub set_name: Option<String>,
+    pub collector_number: String,
+    pub tcgplayer_id: Option<i64>,
+    pub prices: Prices,
+    pub released_at: Option<String>,
+    pub rarity: Option<String>,
 }
 
-#[derive(Serialize, Debug)]
-struct PrintingInfo {
-    id: String,
-    set: String,
-    set_name: String,
-    collector_number: String,
-    tcgplayer_id: Option<i64>,
-    prices: Option<Prices>,
-    image_uris: Option<ImageUris>,
-    released_at: Option<String>,
-    rarity: Option<String>,
+#[derive(Serialize, Deserialize, Debug)]
+pub struct PrintingInfo {
+    pub id: String,
+    pub set: String,
+    pub set_name: String,
+    pub collector_number: String,
+    pub tcgplayer_id: Option<i64>,
+    pub prices: Option<Prices>,
+    pub image_uris: Option<ImageUris>,
+    pub released_at: Option<String>,
+    pub rarity: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct IndexStats {
+    pub card_count: usize,
+    pub set_count: usize,
+    pub last_update: String,
+}
+
+// Public API functions for Python bindings
+
+pub fn run_indexer(redis_url: &String) -> Result<IndexStats, Box<dyn std::error::Error>> {
+    let start_time = Instant::now();
+    
+    println!("=== Starting Enhanced Scryfall Indexer ===");
+    println!("System configuration:");
+    println!("- Batch size: {}", BATCH_SIZE);
+    println!("- Chunk size: {}", CHUNK_SIZE);
+    println!("- Max prefix length: {}", MAX_PREFIX_LENGTH);
+    println!("- N-gram size: {}", NGRAM_SIZE);
+    
+    let cards = download_scryfall_data()?;
+    let (oracle_id_map, all_set_codes, search_indexes) = build_card_index(&cards)?;
+    
+    println!("Connecting to Redis...");
+    let client = Client::open(redis_url.to_string())?;
+    let mut con = client.get_connection()?;
+    
+    let ping: String = redis::cmd("PING").query(&mut con)?;
+    if ping != "PONG" {
+        return Err("Redis connection failed".into());
+    }
+    
+    let card_count = oracle_id_map.len();
+    let set_count = all_set_codes.len();
+    
+    store_card_index(&mut con, oracle_id_map, all_set_codes, search_indexes, &cards)?;
+    
+    let total_time = start_time.elapsed();
+    println!(
+        "=== Total execution time: {:.2} seconds ===",
+        total_time.as_secs_f32()
+    );
+    
+    Ok(IndexStats {
+        card_count,
+        set_count,
+        last_update: Utc::now().to_rfc3339(),
+    })
+}
+
+pub fn search_cards_internal(
+    query: &str,
+    max_results: usize,
+    redis_url: &str,
+) -> Result<Vec<IndexedCard>, Box<dyn std::error::Error>> {
+    let client = Client::open(redis_url.to_string())?;
+    let mut con = client.get_connection()?;
+    
+    // Use the fuzzy search Lua script
+    let script_sha: String = con.get("mtg:script:fuzzy_search")?;
+    
+    let oracle_ids: Vec<String> = redis::cmd("EVALSHA")
+        .arg(&script_sha)
+        .arg(0)
+        .arg(query)
+        .arg(2) // max_distance
+        .arg(max_results)
+        .query(&mut con)?;
+    
+    let mut results = Vec::new();
+    for oracle_id in oracle_ids {
+        if let Ok(card_data) = con.get::<_, String>(format!("card:oracle:{}", oracle_id)) {
+            if let Ok(card) = serde_json::from_str::<IndexedCard>(&card_data) {
+                results.push(card);
+            }
+        }
+    }
+    
+    Ok(results)
+}
+
+pub fn get_card_by_oracle_id_internal(
+    oracle_id: &str,
+    redis_url: &str,
+) -> Result<Option<IndexedCard>, Box<dyn std::error::Error>> {
+    let client = Client::open(redis_url.to_string())?;
+    let mut con = client.get_connection()?;
+    
+    match con.get::<_, String>(format!("card:oracle:{}", oracle_id)) {
+        Ok(card_data) => {
+            let card = serde_json::from_str::<IndexedCard>(&card_data)?;
+            Ok(Some(card))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+pub fn get_autocomplete_internal(
+    prefix: &str,
+    max_results: usize,
+    redis_url: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let client = Client::open(redis_url.to_string())?;
+    let mut con = client.get_connection()?;
+    
+    let prefix_lower = prefix.to_lowercase();
+    let oracle_ids: Vec<String> = con.smembers(format!("auto:prefix:{}", prefix_lower))?;
+    
+    let mut card_names = Vec::new();
+    for oracle_id in oracle_ids.into_iter().take(max_results) {
+        if let Ok(card_data) = con.get::<_, String>(format!("card:oracle:{}", oracle_id)) {
+            if let Ok(card) = serde_json::from_str::<IndexedCard>(&card_data) {
+                card_names.push(card.name);
+            }
+        }
+    }
+    
+    Ok(card_names)
+}
+
+pub fn get_stats_internal(redis_url: &str) -> Result<IndexStats, Box<dyn std::error::Error>> {
+    let client = Client::open(redis_url.to_string())?;
+    let mut con = client.get_connection()?;
+    
+    let card_count: usize = con.get("mtg:stats:card_count").unwrap_or(0);
+    let last_update: String = con.get("mtg:stats:last_update").unwrap_or_else(|_| "Never".to_string());
+    
+    // Count unique sets
+    let sets_data: String = con.get("mtg:sets").unwrap_or_else(|_| "[]".to_string());
+    let sets: Vec<String> = serde_json::from_str(&sets_data).unwrap_or_default();
+    
+    Ok(IndexStats {
+        card_count,
+        set_count: sets.len(),
+        last_update,
+    })
 }
 
 fn download_scryfall_data() -> Result<Vec<ScryfallCard>, Box<dyn std::error::Error>> {
-    println!("Downloading Scryfall default_cards.json (this may take a while)...");
+    println!("Downloading Scryfall all_cards.json (this may take a while)...");
 
     let client = reqwest::blocking::Client::builder()
         .user_agent("MTGPriceAnalyzer/2.0")
@@ -143,16 +279,18 @@ fn download_scryfall_data() -> Result<Vec<ScryfallCard>, Box<dyn std::error::Err
 
     let default_cards_entry = data_array
         .iter()
-        .find(|item| item.get("type").and_then(|t| t.as_str()) == Some("default_cards"))
-        .ok_or("default_cards entry not found")?;
+        .find(|item| item.get("type").and_then(|t| t.as_str()) == Some("all_cards"))
+        .ok_or("all_cards entry not found")?;
 
     let download_uri = default_cards_entry
         .get("download_uri")
         .and_then(|u| u.as_str())
         .ok_or("download_uri field not found or not a string")?;
 
+    let compressed_size = default_cards_entry.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
     println!("Found download URI: {}", download_uri);
-    println!("Downloading card data (~500MB compressed, might take several minutes)...");
+    println!("Downloading ALL card data (~{}MB compressed, includes ALL printings)", compressed_size / 1024 / 1024);
+    println!("This is significantly larger than default_cards and will take longer to process...");
 
     let download_start = Instant::now();
     
@@ -389,8 +527,25 @@ fn build_card_index(
             }
             
             let mut oracle_map_lock = oracle_map.lock().unwrap();
-            for (k, v) in local_oracle_map {
-                oracle_map_lock.entry(k).or_insert(v);
+            for (oracle_id, mut new_card) in local_oracle_map {
+                oracle_map_lock.entry(oracle_id).and_modify(|existing_card| {
+                    // Merge printings from multiple threads
+                    existing_card.prices.append(&mut new_card.prices);
+                    
+                    // Merge sets
+                    for set in new_card.sets {
+                        if !existing_card.sets.contains(&set) {
+                            existing_card.sets.push(set);
+                        }
+                    }
+                    
+                    // Merge TCGPlayer IDs
+                    for tcg_id in new_card.tcgplayer_ids {
+                        if !existing_card.tcgplayer_ids.contains(&tcg_id) {
+                            existing_card.tcgplayer_ids.push(tcg_id);
+                        }
+                    }
+                }).or_insert(new_card);
             }
             
             let mut set_codes_lock = set_codes.lock().unwrap();
@@ -549,6 +704,8 @@ fn store_card_index(
                 }
             }
             
+            // With all_cards, we get multiple printings per card
+            // Using max price to represent the highest-value printing for this card
             let latest_price = card.prices.iter()
                 .filter_map(|p| p.prices.usd.as_ref().and_then(|price| price.parse::<f32>().ok()))
                 .fold(0.0f32, |a, b| a.max(b));
@@ -609,7 +766,7 @@ fn store_card_index(
             }
         }
         
-        pipe.execute(con);
+        let _: () = pipe.query(con)?;
         
         overall_pb.inc(batch.len() as u64);
         batch_pb.finish_with_message(format!("Batch #{} completed", i + 1));
@@ -801,36 +958,24 @@ fn store_card_index(
     Ok(())
 }
 
+fn get_redis_url() -> String {
+    let host = std::env::var("REDIS_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let port = std::env::var("REDIS_PORT").unwrap_or_else(|_| "9999".to_string());
+    format!("redis://{}:{}", host, port)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let start_time = Instant::now();
+    let redis_url = get_redis_url();
+    println!("Using Redis URL: {}", redis_url);
     
-    println!("=== Starting Enhanced Scryfall Indexer ===");
-    println!("System configuration:");
-    println!("- Batch size: {}", BATCH_SIZE);
-    println!("- Chunk size: {}", CHUNK_SIZE);
-    println!("- Max prefix length: {}", MAX_PREFIX_LENGTH);
-    println!("- N-gram size: {}", NGRAM_SIZE);
+    let stats = run_indexer(&redis_url)?;
     
-    let cards = download_scryfall_data()?;
-    let (oracle_id_map, all_set_codes, search_indexes) = build_card_index(&cards)?;
+    println!("Scryfall ALL CARDS data successfully downloaded and indexed with enhanced autocomplete and fuzzy search");
+    println!("Stats: {} unique cards (ALL printings included), {} sets", stats.card_count, stats.set_count);
     
-    println!("Connecting to Redis...");
-    let client = Client::open("redis://127.0.0.1:6379")?;
+    // Display key usage statistics
+    let client = Client::open(redis_url.clone())?;
     let mut con = client.get_connection()?;
-    
-    let ping: String = redis::cmd("PING").query(&mut con)?;
-    if ping != "PONG" {
-        return Err("Redis connection failed".into());
-    }
-    
-    store_card_index(&mut con, oracle_id_map, all_set_codes, search_indexes, &cards)?;
-    
-    let total_time = start_time.elapsed();
-    println!(
-        "=== Total execution time: {:.2} seconds ===",
-        total_time.as_secs_f32()
-    );
-    println!("Scryfall data successfully downloaded and indexed with enhanced autocomplete and fuzzy search");
     
     let key_types = [
         "card:oracle:*", "card:name:*", "auto:prefix:*", "auto:word:*",
