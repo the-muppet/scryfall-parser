@@ -4,6 +4,9 @@ use pyo3::types::PyDict;
 mod main;
 use main::*;
 
+// API modules
+pub mod redis_client;
+
 /// Download Scryfall data and build indexes
 #[pyfunction]
 fn download_and_index(redis_url: Option<String>) -> PyResult<String> {
