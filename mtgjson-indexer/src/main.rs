@@ -97,7 +97,7 @@ impl MTGJSONIndexer {
         let redis_client = Client::open(redis_url)
             .context("Failed to create Redis client")?;
 
-        // Configure Rayon for high-end hardware (20 cores + hyperthreading)
+        // high-end hardware config
         let num_threads = std::env::var("MTGJSON_THREADS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -1198,8 +1198,8 @@ impl MTGJSONIndexer {
 
         pb.finish_with_message("Card storage complete");
         
-        // Build comprehensive search indexes for all cards
-        self.build_and_store_search_indexes(&mut con, &all_indexed_cards)?;
+        // Create RediSearch indexes for fast search and autocomplete
+        self.create_redisearch_indexes(&mut con)?;
 
         // Process decks with or without pricing information
         if !decks.is_empty() {
@@ -1265,11 +1265,33 @@ impl MTGJSONIndexer {
     fn clear_redis_data(&self, con: &mut Connection) -> Result<()> {
         println!("Clearing existing Redis data...");
         
+        // Drop RediSearch indexes first
+        let indexes = vec![
+            "mtg:cards:idx",
+            "mtg:decks:idx", 
+            "mtg:sets:idx"
+        ];
+        
+        for index in indexes {
+            let _: Result<String, redis::RedisError> = redis::cmd("FT.DROPINDEX")
+                .arg(index)
+                .arg("DD") // Delete documents
+                .query(con);
+            println!("  ✓ Dropped RediSearch index: {}", index);
+        }
+        
+        // Clear suggestion dictionaries
+        let _: Result<i64, redis::RedisError> = redis::cmd("FT.SUGDEL")
+            .arg("mtg:cards:names")
+            .arg("*")
+            .query(con);
+        
+        // Clear remaining key patterns
         let patterns = vec![
-            "mtgjson:*", "card:*", "set:*", "name:*", 
+            "mtg:*", "card:*", "set:*", "name:*", 
             "uuid:*", "oracle:*", "tcgplayer:*", "sku:*", "price:*",
             "deck:*", "auto:*", "ngram:*", "metaphone:*", "word:*",
-            "price_range:*"  // Include new price range indexes
+            "price_range:*"
         ];
 
         for pattern in patterns {
@@ -1283,13 +1305,76 @@ impl MTGJSONIndexer {
             }
         }
 
-        // Clear trending data for SKU pricing
-        let trending_keys = vec!["price:trending:up", "price:trending:down"];
-        for key in trending_keys {
-            let _: () = con.del(key).unwrap_or(());
-            println!("  ✓ Cleared trending key: {}", key);
-        }
+        Ok(())
+    }
 
+    fn create_redisearch_indexes(&self, con: &mut Connection) -> Result<()> {
+        println!("Creating RediSearch indexes...");
+        
+        // Create main card index
+        let card_index_result: Result<String, redis::RedisError> = redis::cmd("FT.CREATE")
+            .arg("mtg:cards:idx")
+            .arg("ON").arg("JSON")
+            .arg("PREFIX").arg(1).arg("mtg:cards:data:")
+            .arg("SCHEMA")
+            .arg("$.uuid").arg("AS").arg("uuid").arg("TEXT").arg("NOSTEM").arg("SORTABLE")
+            .arg("$.name").arg("AS").arg("name").arg("TEXT").arg("PHONETIC").arg("dm:en").arg("SORTABLE")
+            .arg("$.set_code").arg("AS").arg("set_code").arg("TAG").arg("SORTABLE")
+            .arg("$.set_name").arg("AS").arg("set_name").arg("TEXT").arg("SORTABLE")
+            .arg("$.mana_value").arg("AS").arg("mana_value").arg("NUMERIC").arg("SORTABLE")
+            .arg("$.types").arg("AS").arg("types").arg("TAG").arg("SEPARATOR").arg(" ")
+            .arg("$.colors").arg("AS").arg("colors").arg("TAG").arg("SEPARATOR").arg(",")
+            .arg("$.color_identity").arg("AS").arg("color_identity").arg("TAG").arg("SEPARATOR").arg(",")
+            .arg("$.rarity").arg("AS").arg("rarity").arg("TAG").arg("SORTABLE")
+            .arg("$.tcgplayer_product_id").arg("AS").arg("tcg_product").arg("NUMERIC")
+            .arg("$.text").arg("AS").arg("oracle_text").arg("TEXT")
+            .arg("$.release_date").arg("AS").arg("release_date").arg("TEXT").arg("SORTABLE")
+            .query(con);
+            
+        match card_index_result {
+            Ok(_) => println!("  ✓ Created mtg:cards:idx"),
+            Err(e) => println!("  ⚠ Card index creation failed: {}", e),
+        }
+        
+        // Create deck index
+        let deck_index_result: Result<String, redis::RedisError> = redis::cmd("FT.CREATE")
+            .arg("mtg:decks:idx")
+            .arg("ON").arg("JSON")
+            .arg("PREFIX").arg(1).arg("mtg:decks:data:")
+            .arg("SCHEMA")
+            .arg("$.uuid").arg("AS").arg("uuid").arg("TEXT").arg("NOSTEM")
+            .arg("$.name").arg("AS").arg("name").arg("TEXT").arg("PHONETIC").arg("dm:en").arg("SORTABLE")
+            .arg("$.deck_type").arg("AS").arg("deck_type").arg("TAG").arg("SORTABLE")
+            .arg("$.estimated_value.market_total").arg("AS").arg("market_value").arg("NUMERIC").arg("SORTABLE")
+            .arg("$.total_cards").arg("AS").arg("total_cards").arg("NUMERIC").arg("SORTABLE")
+            .arg("$.is_commander").arg("AS").arg("is_commander").arg("TAG")
+            .arg("$.release_date").arg("AS").arg("release_date").arg("TEXT").arg("SORTABLE")
+            .query(con);
+            
+        match deck_index_result {
+            Ok(_) => println!("  ✓ Created mtg:decks:idx"),
+            Err(e) => println!("  ⚠ Deck index creation failed: {}", e),
+        }
+        
+        // Create set index  
+        let set_index_result: Result<String, redis::RedisError> = redis::cmd("FT.CREATE")
+            .arg("mtg:sets:idx")
+            .arg("ON").arg("JSON")
+            .arg("PREFIX").arg(1).arg("mtg:sets:data:")
+            .arg("SCHEMA")
+            .arg("$.code").arg("AS").arg("code").arg("TAG").arg("SORTABLE")
+            .arg("$.name").arg("AS").arg("name").arg("TEXT").arg("SORTABLE")
+            .arg("$.set_type").arg("AS").arg("set_type").arg("TAG").arg("SORTABLE")
+            .arg("$.release_date").arg("AS").arg("release_date").arg("TEXT").arg("SORTABLE")
+            .arg("$.total_cards").arg("AS").arg("total_cards").arg("NUMERIC").arg("SORTABLE")
+            .query(con);
+            
+        match set_index_result {
+            Ok(_) => println!("  ✓ Created mtg:sets:idx"),
+            Err(e) => println!("  ⚠ Set index creation failed: {}", e),
+        }
+        
+        println!("✅ RediSearch indexes created");
         Ok(())
     }
 
@@ -1304,124 +1389,131 @@ impl MTGJSONIndexer {
         pipe.atomic();
         
         let timestamp = chrono::Utc::now().timestamp();
-        
-        // Pre-allocate capacity for better performance
-        let _estimated_commands = cards.len() * 12; // More commands due to SKU pricing
-        pipe.cmd("PING"); // Ensure pipeline is initialized
 
         for card in &cards {
             let card_json = serde_json::to_string(card)
                 .context("Failed to serialize card")?;
 
-            // Store main card data
-            pipe.cmd("SET").arg(format!("card:{}", card.uuid)).arg(&card_json);
+            // Store as RediSearch JSON document - this replaces ALL manual indexing
+            pipe.cmd("JSON.SET")
+                .arg(format!("mtg:cards:data:{}", card.uuid))
+                .arg("$")
+                .arg(&card_json);
 
-            // Index by name (exact match)
-            let name_key = card.name.to_lowercase();
-            pipe.cmd("SADD").arg(format!("name:{}", name_key)).arg(&card.uuid);
-
-            // Index by set
-            pipe.cmd("SADD").arg(format!("set:{}:cards", card.set_code)).arg(&card.uuid);
-
-            // Index by Oracle ID if available
-            if let Some(oracle_id) = &card.scryfall_oracle_id {
-                pipe.cmd("SET").arg(format!("oracle:{}", oracle_id)).arg(&card.uuid);
-                pipe.cmd("SET").arg(format!("uuid:{}:oracle", card.uuid)).arg(oracle_id);
-            }
-
-            // Index by TCGPlayer Product ID and implement SKU-based pricing
+            // TCGPlayer pricing chain - optimized for search performance
             if let Some(product_id) = &card.tcgplayer_product_id {
-                pipe.cmd("SET").arg(format!("tcgplayer:{}", product_id)).arg(&card.uuid);
+                // Direct UUID -> ProductID mapping (step 1 of pricing chain)
+                pipe.cmd("SET").arg(format!("mtg:tcg:uuid_to_product:{}", card.uuid)).arg(product_id);
+                pipe.cmd("SADD").arg(format!("mtg:tcg:product_cards:{}", product_id)).arg(&card.uuid);
                 
-                // Store SKU-based pricing (NEW PATTERN)
+                // Store SKU-based pricing (steps 2-3 of pricing chain)
                 if let Some(skus) = sku_index.get(product_id) {
                     for sku in skus {
                         let sku_id = sku.sku_id.to_string();
                         
-                        // Store SKU metadata
+                        // ProductID -> SKU mappings (step 2)
+                        pipe.cmd("SADD").arg(format!("mtg:tcg:product_skus:{}", product_id)).arg(&sku_id);
+                        
+                        // SKU metadata for condition/language filtering
                         let sku_meta = serde_json::json!({
                             "condition": sku.condition.clone().unwrap_or_else(|| "Near Mint".to_string()),
                             "language": sku.language.clone().unwrap_or_else(|| "English".to_string()),
                             "foil": sku.printing.as_deref() == Some("Foil"),
                             "product_id": product_id,
+                            "card_uuid": card.uuid
                         });
                         
-                        pipe.cmd("SET").arg(format!("sku:{}:meta", sku_id)).arg(sku_meta.to_string());
+                        pipe.cmd("JSON.SET")
+                            .arg(format!("mtg:tcg:sku_meta:{}", sku_id))
+                            .arg("$")
+                            .arg(sku_meta.to_string());
                         
-                        // Create bidirectional card-SKU mapping
-                        pipe.cmd("SET").arg(format!("sku:{}:card", sku_id)).arg(&card.uuid);
-                        pipe.cmd("SADD").arg(format!("card:{}:skus", card.uuid)).arg(&sku_id);
-                        
-                        // Store SKU-based pricing data
+                        // SKU pricing data (step 3 - final pricing)
                         if let Some(prices) = pricing_data.get(&sku_id) {
                             for price in prices {
-                                // Store latest pricing (NEW PATTERN: price:sku:{sku_id}:latest)
                                 let price_json = serde_json::json!({
                                     "sku_id": sku_id,
                                     "tcg_market_price": price.tcg_market_price,
                                     "tcg_direct_low": price.tcg_direct_low,
                                     "tcg_low_price": price.tcg_low_price,
+                                    "condition": price.condition,
                                     "timestamp": timestamp
                                 });
                                 
-                                pipe.cmd("SET").arg(format!("price:sku:{}:latest", sku_id)).arg(price_json.to_string());
+                                // Latest pricing (key for quick lookups)
+                                pipe.cmd("JSON.SET")
+                                    .arg(format!("mtg:tcg:sku_price:{}", sku_id))
+                                    .arg("$")
+                                    .arg(price_json.to_string());
                                 
-                                // Store historical price point (NEW PATTERN: price:sku:{sku_id}:history)
+                                // Historical pricing for trends
                                 if let Some(market_price) = price.tcg_market_price {
                                     pipe.cmd("ZADD")
-                                        .arg(format!("price:sku:{}:history", sku_id))
+                                        .arg(format!("mtg:tcg:price_history:{}", sku_id))
                                         .arg(timestamp)
                                         .arg(market_price);
-                                    
-                                    // Index by price ranges using SKU ID (NEW PATTERN)
-                                    let price_bucket = Self::get_price_bucket(market_price);
-                                    pipe.cmd("SADD").arg(format!("price:range:{}", price_bucket)).arg(&sku_id);
                                 }
-                                                         
-                                let legacy_price_key = format!("price:{}:{}", card.uuid, price.condition);
-                                let legacy_price_data = serde_json::json!({
-                                    "tcg_market_price": price.tcg_market_price,
-                                    "tcg_direct_low": price.tcg_direct_low,
-                                    "tcg_low_price": price.tcg_low_price,
-                                    "condition": price.condition,
-                                    "product_name": price.product_name,
-                                    "set_name": price.set_name,
-                                    "sku_id": sku_id 
-                                });
-                                pipe.cmd("SET").arg(legacy_price_key).arg(legacy_price_data.to_string());
                             }
                         }
                     }
                 }
             }
 
-            // Index TCGPlayer SKUs
+            // Also handle cards with direct SKUs (no product_id)
             for sku in &card.tcgplayer_skus {
                 let sku_id = sku.sku_id.to_string();
                 
-                pipe.cmd("SET").arg(format!("sku:{}", sku_id)).arg(&card.uuid);
-                
                 if card.tcgplayer_product_id.is_none() {
+                    // Direct UUID -> SKU mapping for cards without product_id
+                    pipe.cmd("SADD").arg(format!("mtg:tcg:uuid_skus:{}", card.uuid)).arg(&sku_id);
+                    
                     let sku_meta = serde_json::json!({
                         "condition": sku.condition.clone().unwrap_or_else(|| "Near Mint".to_string()),
                         "language": sku.language.clone().unwrap_or_else(|| "English".to_string()),
                         "foil": sku.printing.as_deref() == Some("Foil"),
-                        "product_id": sku.product_id
+                        "product_id": sku.product_id,
+                        "card_uuid": card.uuid
                     });
                     
-                    pipe.cmd("SET").arg(format!("sku:{}:meta", sku_id)).arg(sku_meta.to_string());
-                    pipe.cmd("SET").arg(format!("sku:{}:card", sku_id)).arg(&card.uuid);
-                    pipe.cmd("SADD").arg(format!("card:{}:skus", card.uuid)).arg(&sku_id);
+                    pipe.cmd("JSON.SET")
+                        .arg(format!("mtg:tcg:sku_meta:{}", sku_id))
+                        .arg("$")
+                        .arg(sku_meta.to_string());
                 }
             }
-
-            // Create enhanced search indexes for partial name matching
-            self.add_enhanced_search_indexes(&mut pipe, &card.name, &card.uuid);
         }
 
+        // Execute pipeline
         let _: () = pipe.query(con)
             .context("Failed to execute Redis pipeline")?;
 
+        // Build autocomplete suggestions separately for better performance
+        self.build_autocomplete_suggestions(con, &cards)?;
+
+        Ok(())
+    }
+    
+    fn build_autocomplete_suggestions(&self, con: &mut Connection, cards: &[IndexedCard]) -> Result<()> {
+        for card in cards {
+            // Add card name to suggestions with score based on popularity/rarity
+            let score = match card.rarity.as_str() {
+                "mythic" => 10.0,
+                "rare" => 8.0,
+                "uncommon" => 5.0,
+                "common" => 3.0,
+                _ => 1.0,
+            };
+            
+            // Add to FT.SUGADD for fast autocomplete
+            let _: Result<i64, redis::RedisError> = redis::cmd("FT.SUGADD")
+                .arg("mtg:autocomplete:names")
+                .arg(&card.name)
+                .arg(score)
+                .arg("PAYLOAD")
+                .arg(&card.uuid)
+                .query(con);
+        }
+        
         Ok(())
     }
 
@@ -1437,151 +1529,42 @@ impl MTGJSONIndexer {
             let deck_json = serde_json::to_string(deck)
                 .context("Failed to serialize deck")?;
 
-            // Store main deck data
-            pipe.cmd("SET").arg(format!("deck:{}", deck.uuid)).arg(&deck_json);
+            // Store as RediSearch JSON document
+            pipe.cmd("JSON.SET")
+                .arg(format!("mtg:decks:data:{}", deck.uuid))
+                .arg("$")
+                .arg(&deck_json);
 
-            // Create a human-readable deck slug for easy lookup
-            let deck_slug = format!("{}_{}", 
-                deck.code.to_lowercase().replace(" ", "_"),
-                deck.name.to_lowercase().replace(" ", "_").replace("/", "_")
-            );
-            
-            // Store deck metadata for easy browsing (without full card lists)
-            let deck_metadata = serde_json::json!({
-                "uuid": deck.uuid,
-                "name": deck.name,
-                "code": deck.code,
-                "type": deck.deck_type,
-                "release_date": deck.release_date,
-                "is_commander": deck.is_commander,
-                "total_cards": deck.total_cards,
-                "unique_cards": deck.unique_cards,
-                "slug": deck_slug,
-                "estimated_value": deck.estimated_value
-            });
-            
-            pipe.cmd("SET").arg(format!("deck:slug:{}", deck_slug)).arg(&deck.uuid);
-            pipe.cmd("SET").arg(format!("deck:meta:{}", deck.uuid)).arg(deck_metadata.to_string());
-            pipe.cmd("HSET").arg("deck:directory")
-                .arg(&deck.uuid)
-                .arg(format!("{}|{}|{}|{}", deck.name, deck.code, deck.deck_type, deck.release_date));
-
-            // Index by name (exact match and partial)
-            let name_key = deck.name.to_lowercase();
-            pipe.cmd("SADD").arg(format!("deck:name:{}", name_key)).arg(&deck.uuid);
-            
-            // Index by name words for partial search
-            for word in name_key.split_whitespace() {
-                if word.len() >= 2 {
-                    pipe.cmd("SADD").arg(format!("deck:name_word:{}", word)).arg(&deck.uuid);
-                }
-            }
-
-            // Index by type
-            pipe.cmd("SADD").arg(format!("deck:type:{}", deck.deck_type.to_lowercase())).arg(&deck.uuid);
-
-            // Index by set (deck code)
-            pipe.cmd("SADD").arg(format!("deck:set:{}", deck.code.to_lowercase())).arg(&deck.uuid);
-
-            // Index by release date (year and full date)
-            pipe.cmd("SADD").arg(format!("deck:release:{}", deck.release_date)).arg(&deck.uuid);
-            if let Some(year) = deck.release_date.split('-').next() {
-                pipe.cmd("SADD").arg(format!("deck:year:{}", year)).arg(&deck.uuid);
-            }
-
-            // Index by commander status
-            pipe.cmd("SADD").arg(format!("deck:commander:{}", deck.is_commander)).arg(&deck.uuid);
-
-            // Store deck composition with enhanced indexing
+            // Store deck composition with card quantities
             let all_cards: Vec<&DeckCardInfo> = deck.commanders.iter()
                 .chain(deck.main_board.iter())
                 .chain(deck.side_board.iter())
                 .collect();
             
             for card in &all_cards {
-                // Add card to deck with quantity as score (using both UUID and slug for easy access)
+                // Store card-deck relationships with quantities
                 pipe.cmd("ZADD")
-                    .arg(format!("deck:{}:cards", deck.uuid))
+                    .arg(format!("mtg:decks:cards:{}", deck.uuid))
                     .arg(card.count)
                     .arg(&card.uuid);
                     
-                pipe.cmd("ZADD")
-                    .arg(format!("deck:slug:{}:cards", deck_slug))
-                    .arg(card.count)
-                    .arg(&card.uuid);
-
-                // Add deck to card's deck list (with metadata for easy browsing)
+                // Store deck-card relationships (reverse lookup)
                 pipe.cmd("SADD")
-                    .arg(format!("card:{}:decks", card.uuid))
+                    .arg(format!("mtg:cards:decks:{}", card.uuid))
                     .arg(&deck.uuid);
-                    
-                // Store card-deck relationship with metadata
-                pipe.cmd("HSET")
-                    .arg(format!("card:{}:deck_info", card.uuid))
-                    .arg(&deck.uuid)
-                    .arg(format!("{}|{}|{}", deck.name, deck.code, card.count));
             }
 
-            // Store commanders separately for EDH decks with enhanced indexing
+            // Store commanders separately for EDH/Commander format
             for commander in &deck.commanders {
                 pipe.cmd("SADD")
-                    .arg(format!("deck:{}:commanders", deck.uuid))
+                    .arg(format!("mtg:decks:commanders:{}", deck.uuid))
                     .arg(&commander.uuid);
                     
                 // Index by commander for finding all decks with specific commanders
                 pipe.cmd("SADD")
-                    .arg(format!("commander:{}:decks", commander.uuid))
-                    .arg(&deck.uuid);
-                    
-                // Store commander name mapping for easy lookup
-                pipe.cmd("HSET")
-                    .arg("commander:directory")
-                    .arg(&commander.uuid)
-                    .arg(&commander.name);
-            }
-
-            // === ENHANCED SEARCH INDEXES ===
-            
-            // Create search indexes for deck names (n-grams, prefixes, etc.)
-            self.add_deck_search_indexes(&mut pipe, &deck.name, &deck.uuid);
-
-            // Index by value ranges if pricing is available (with multiple price points)
-            if let Some(value) = &deck.estimated_value {
-                let market_bucket = Self::get_value_bucket(value.market_total);
-                let direct_bucket = Self::get_value_bucket(value.direct_total);
-                let low_bucket = Self::get_value_bucket(value.low_total);
-                
-                pipe.cmd("SADD")
-                    .arg(format!("deck:value_market:{}", market_bucket))
-                    .arg(&deck.uuid);
-                pipe.cmd("SADD")
-                    .arg(format!("deck:value_direct:{}", direct_bucket))
-                    .arg(&deck.uuid);
-                pipe.cmd("SADD")
-                    .arg(format!("deck:value_low:{}", low_bucket))
-                    .arg(&deck.uuid);
-                    
-                // Store exact values for sorting
-                pipe.cmd("ZADD")
-                    .arg("deck:sorted_by_market_value")
-                    .arg(value.market_total)
-                    .arg(&deck.uuid);
-                pipe.cmd("ZADD")
-                    .arg("deck:sorted_by_direct_value")
-                    .arg(value.direct_total)
+                    .arg(format!("mtg:commanders:decks:{}", commander.uuid))
                     .arg(&deck.uuid);
             }
-            
-            // Index by card count ranges
-            let card_count_bucket = match deck.total_cards {
-                0..=40 => "small",
-                41..=60 => "standard", 
-                61..=99 => "large",
-                100.. => "edh_plus",
-            };
-            pipe.cmd("SADD")
-                .arg(format!("deck:size:{}", card_count_bucket))
-                .arg(&deck.uuid);
         }
 
         let _: () = pipe.query(con)

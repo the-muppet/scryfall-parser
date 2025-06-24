@@ -262,13 +262,26 @@ impl MTGRedisClient {
 
     pub async fn get_card_by_uuid(&mut self, uuid: &str) -> Result<Option<IndexedCard>> {
         let mut con = self.client.get_multiplexed_async_connection().await?;
-        let key = format!("card:{}", uuid);
-        let data: Option<String> = con.get(&key).await?;
+        let key = format!("mtg:cards:data:{}", uuid);
+        
+        // Use JSON.GET to retrieve the RediSearch JSON document
+        let data: Option<String> = redis::cmd("JSON.GET")
+            .arg(&key)
+            .arg("$")
+            .query_async(&mut con)
+            .await
+            .unwrap_or(None);
         
         match data {
             Some(json_str) => {
-                let card = serde_json::from_str(&json_str)?;
-                Ok(Some(card))
+                // JSON.GET returns a JSON array, extract the first element
+                let parsed: Vec<serde_json::Value> = serde_json::from_str(&json_str)?;
+                if let Some(card_data) = parsed.first() {
+                    let card: IndexedCard = serde_json::from_value(card_data.clone())?;
+                    Ok(Some(card))
+                } else {
+                    Ok(None)
+                }
             }
             None => Ok(None),
         }
@@ -289,52 +302,59 @@ impl MTGRedisClient {
     }
 
     pub async fn search_cards_by_name(&mut self, query: &str, max_results: usize, filters: HashMap<String, String>) -> Result<Vec<serde_json::Value>> {
-        let mut args = vec![query.to_string(), max_results.to_string()];
+        let mut con = self.client.get_multiplexed_async_connection().await?;
         
-        // Add filter arguments
+        // Build RediSearch query with filters
+        let mut search_query = if query.is_empty() {
+            "*".to_string()
+        } else {
+            format!("@name:{}", query)
+        };
+        
+        // Add filters to the query
         for (key, value) in filters {
-            args.push(key);
-            args.push(value);
+            match key.as_str() {
+                "set_code" => search_query.push_str(&format!(" @set_code:{{{}}}", value)),
+                "rarity" => search_query.push_str(&format!(" @rarity:{{{}}}", value)),
+                "colors" => search_query.push_str(&format!(" @colors:{{{}}}", value)),
+                "types" => search_query.push_str(&format!(" @types:{{{}}}", value)),
+                "mana_value" => search_query.push_str(&format!(" @mana_value:[{} {}]", value, value)),
+                _ => {} // Ignore unknown filters
+            }
         }
         
-        let result: redis::Value = self.execute_lua_script_raw("search_cards", args).await?;
+        // Execute FT.SEARCH
+        let search_result: redis::RedisResult<Vec<redis::Value>> = redis::cmd("FT.SEARCH")
+            .arg("mtg:cards:idx")
+            .arg(&search_query)
+            .arg("LIMIT")
+            .arg(0)
+            .arg(max_results)
+            .arg("SORTBY")
+            .arg("name")
+            .arg("ASC")
+            .query_async(&mut con)
+            .await;
+            
+        let mut cards = Vec::new();
         
-        match result {
-            redis::Value::Array(items) => {
-                let mut cards = Vec::new();
-                for item in items.iter() {
-                    match item {
-                        redis::Value::BulkString(json_bytes) => {
-                            if let Ok(json_str) = String::from_utf8(json_bytes.clone()) {
-                                if let Ok(card_json) = serde_json::from_str::<serde_json::Value>(&json_str) {
-                                    cards.push(card_json);
-                                }
-                            }
-                        }
-                        redis::Value::SimpleString(json_str) => {
-                            if let Ok(card_json) = serde_json::from_str::<serde_json::Value>(json_str) {
-                                cards.push(card_json);
-                            }
-                        }
-                        redis::Value::Array(card_fields) => {
-                            if let Ok(card_json) = redis_array_to_json_object(&card_fields) {
-                                cards.push(card_json);
-                            }
-                        }
-                        _ => {
-                            // Handle other Redis value types if needed
-                            if let Ok(json_val) = redis_value_to_json(&item) {
-                                cards.push(json_val);
-                            }
+        if let Ok(results) = search_result {
+            // RediSearch returns [count, key1, doc1, key2, doc2, ...]
+            if results.len() > 1 {
+                let mut i = 1; // Skip count
+                while i + 1 < results.len() {
+                    // Extract the JSON document (every other result starting from index 2)
+                    if let Ok(doc_data) = redis::from_redis_value::<String>(&results[i + 1]) {
+                        if let Ok(card_json) = serde_json::from_str::<serde_json::Value>(&doc_data) {
+                            cards.push(card_json);
                         }
                     }
+                    i += 2; // Skip to next key-value pair
                 }
-                Ok(cards)
-            }
-            _ => {
-                Err(anyhow::anyhow!("Unexpected return type from search_cards Lua script: {:?}", result))
             }
         }
+        
+        Ok(cards)
     }
 
     pub async fn get_cards_in_set(&mut self, set_code: &str) -> Result<HashSet<String>> {
@@ -346,19 +366,23 @@ impl MTGRedisClient {
 
     pub async fn autocomplete_card_names(&mut self, prefix: &str, limit: usize) -> Result<Vec<String>> {
         let mut con = self.client.get_multiplexed_async_connection().await?;
-        let prefix_lower = prefix.to_lowercase();
-        let key = format!("auto:prefix:{}", prefix_lower);
         
-        let card_uuids: HashSet<String> = con.smembers(&key).await.unwrap_or_default();
+        // Use RediSearch autocomplete with FT.SUGGET
+        let suggestions: Vec<String> = redis::cmd("FT.SUGGET")
+            .arg("mtg:autocomplete:names")
+            .arg(prefix)
+            .arg("MAX")
+            .arg(limit)
+            .arg("WITHPAYLOADS")
+            .query_async(&mut con)
+            .await
+            .unwrap_or_default();
+        
+        // Extract just the suggestion names (every other element)
         let mut card_names = Vec::new();
-        
-        for card_uuid in card_uuids.into_iter().take(limit * 2) {
-            if card_names.len() >= limit {
-                break;
-            }
-            
-            if let Ok(Some(card)) = self.get_card_by_uuid(&card_uuid).await {
-                card_names.push(card.name);
+        for i in (0..suggestions.len()).step_by(2) {
+            if i < suggestions.len() {
+                card_names.push(suggestions[i].clone());
             }
         }
         
@@ -368,43 +392,55 @@ impl MTGRedisClient {
     pub async fn fuzzy_search_cards(&mut self, query: &str, limit: usize) -> Result<Vec<serde_json::Value>> {
         let mut con = self.client.get_multiplexed_async_connection().await?;
         
-        // Try to get the fuzzy search script SHA
-        let script_sha: Option<String> = con.get("mtgjson:script:fuzzy_search").await.unwrap_or(None);
+        // Use RediSearch fuzzy matching with % prefix and suffix for fuzzy search
+        let fuzzy_query = format!("%{}%", query);
+        let search_query = format!("@name:{}", fuzzy_query);
         
-        if let Some(sha) = script_sha {
-            // Use the loaded fuzzy search script
-            let result: Vec<String> = redis::cmd("EVALSHA")
-                .arg(sha)
-                .arg(0)
-                .arg(query)
-                .arg(2) // max_distance
-                .arg(limit)
-                .query_async(&mut con)
-                .await
-                .unwrap_or_default();
-                
-            let mut cards = Vec::new();
-            for uuid in result {
-                if let Ok(Some(card)) = self.get_card_by_uuid(&uuid).await {
-                    cards.push(serde_json::json!({
-                        "uuid": card.uuid,
-                        "name": card.name,
-                        "set_code": card.set_code,
-                        "set_name": card.set_name,
-                        "mana_cost": card.mana_cost,
-                        "mana_value": card.mana_value,
-                        "rarity": card.rarity,
-                        "types": card.types,
-                        "colors": card.colors,
-                        "text": card.text
-                    }));
+        // Execute FT.SEARCH with fuzzy matching
+        let search_result: redis::RedisResult<Vec<redis::Value>> = redis::cmd("FT.SEARCH")
+            .arg("mtg:cards:idx")
+            .arg(&search_query)
+            .arg("LIMIT")
+            .arg(0)
+            .arg(limit)
+            .arg("SORTBY")
+            .arg("name")
+            .arg("ASC")
+            .query_async(&mut con)
+            .await;
+            
+        let mut cards = Vec::new();
+        
+        if let Ok(results) = search_result {
+            // RediSearch returns [count, key1, doc1, key2, doc2, ...]
+            if results.len() > 1 {
+                let mut i = 1; // Skip count
+                while i + 1 < results.len() {
+                    // Extract the JSON document
+                    if let Ok(doc_data) = redis::from_redis_value::<String>(&results[i + 1]) {
+                        if let Ok(card_data) = serde_json::from_str::<serde_json::Value>(&doc_data) {
+                            // Format the response with key fields
+                            let card_json = serde_json::json!({
+                                "uuid": card_data.get("uuid"),
+                                "name": card_data.get("name"),
+                                "set_code": card_data.get("set_code"),
+                                "set_name": card_data.get("set_name"),
+                                "mana_cost": card_data.get("mana_cost"),
+                                "mana_value": card_data.get("mana_value"),
+                                "rarity": card_data.get("rarity"),
+                                "types": card_data.get("types"),
+                                "colors": card_data.get("colors"),
+                                "text": card_data.get("text")
+                            });
+                            cards.push(card_json);
+                        }
+                    }
+                    i += 2; // Skip to next key-value pair
                 }
             }
-            Ok(cards)
-        } else {
-            // Fallback to regular search if fuzzy search script not available
-            self.search_cards_by_name(query, limit, HashMap::new()).await
         }
+        
+        Ok(cards)
     }
 
     // =============================================================================
@@ -466,30 +502,26 @@ impl MTGRedisClient {
     pub async fn get_deck_by_uuid(&mut self, uuid: &str) -> Result<Option<IndexedDeck>> {
         let mut con = self.client.get_multiplexed_async_connection().await?;
         
-        // Normalize UUID format - ensure it starts with deck_ if not already
-        let formatted_uuid = if uuid.starts_with("deck_") {
-            uuid.to_string()
-        } else {
-            format!("deck_{}", uuid)
-        };
+        let key = format!("mtg:decks:data:{}", uuid);
         
-        // Try meta first for lightweight operations
-        let meta_key = format!("deck:meta:{}", formatted_uuid);
-        let meta_data: Option<String> = con.get(&meta_key).await.unwrap_or(None);
+        // Use JSON.GET to retrieve the RediSearch JSON document
+        let data: Option<String> = redis::cmd("JSON.GET")
+            .arg(&key)
+            .arg("$")
+            .query_async(&mut con)
+            .await
+            .unwrap_or(None);
         
-        if let Some(json_str) = meta_data {
-            let deck = serde_json::from_str(&json_str)?;
-            return Ok(Some(deck));
-        }
-        
-        // Fall back to full deck data
-        let full_key = format!("deck:{}", formatted_uuid);
-        let full_data: Option<String> = con.get(&full_key).await.unwrap_or(None);
-        
-        match full_data {
+        match data {
             Some(json_str) => {
-                let deck = serde_json::from_str(&json_str)?;
-                Ok(Some(deck))
+                // JSON.GET returns a JSON array, extract the first element
+                let parsed: Vec<serde_json::Value> = serde_json::from_str(&json_str)?;
+                if let Some(deck_data) = parsed.first() {
+                    let deck: IndexedDeck = serde_json::from_value(deck_data.clone())?;
+                    Ok(Some(deck))
+                } else {
+                    Ok(None)
+                }
             }
             None => Ok(None),
         }
