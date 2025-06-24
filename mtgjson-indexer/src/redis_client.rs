@@ -365,6 +365,48 @@ impl MTGRedisClient {
         Ok(card_names)
     }
 
+    pub async fn fuzzy_search_cards(&mut self, query: &str, limit: usize) -> Result<Vec<serde_json::Value>> {
+        let mut con = self.client.get_multiplexed_async_connection().await?;
+        
+        // Try to get the fuzzy search script SHA
+        let script_sha: Option<String> = con.get("mtgjson:script:fuzzy_search").await.unwrap_or(None);
+        
+        if let Some(sha) = script_sha {
+            // Use the loaded fuzzy search script
+            let result: Vec<String> = redis::cmd("EVALSHA")
+                .arg(sha)
+                .arg(0)
+                .arg(query)
+                .arg(2) // max_distance
+                .arg(limit)
+                .query_async(&mut con)
+                .await
+                .unwrap_or_default();
+                
+            let mut cards = Vec::new();
+            for uuid in result {
+                if let Ok(Some(card)) = self.get_card_by_uuid(&uuid).await {
+                    cards.push(serde_json::json!({
+                        "uuid": card.uuid,
+                        "name": card.name,
+                        "set_code": card.set_code,
+                        "set_name": card.set_name,
+                        "mana_cost": card.mana_cost,
+                        "mana_value": card.mana_value,
+                        "rarity": card.rarity,
+                        "types": card.types,
+                        "colors": card.colors,
+                        "text": card.text
+                    }));
+                }
+            }
+            Ok(cards)
+        } else {
+            // Fallback to regular search if fuzzy search script not available
+            self.search_cards_by_name(query, limit, HashMap::new()).await
+        }
+    }
+
     // =============================================================================
     // DECK OPERATIONS
     // =============================================================================
@@ -424,8 +466,15 @@ impl MTGRedisClient {
     pub async fn get_deck_by_uuid(&mut self, uuid: &str) -> Result<Option<IndexedDeck>> {
         let mut con = self.client.get_multiplexed_async_connection().await?;
         
+        // Normalize UUID format - ensure it starts with deck_ if not already
+        let formatted_uuid = if uuid.starts_with("deck_") {
+            uuid.to_string()
+        } else {
+            format!("deck_{}", uuid)
+        };
+        
         // Try meta first for lightweight operations
-        let meta_key = format!("deck:meta:deck_{}", uuid);
+        let meta_key = format!("deck:meta:{}", formatted_uuid);
         let meta_data: Option<String> = con.get(&meta_key).await.unwrap_or(None);
         
         if let Some(json_str) = meta_data {
@@ -434,7 +483,7 @@ impl MTGRedisClient {
         }
         
         // Fall back to full deck data
-        let full_key = format!("deck:deck_{}", uuid);
+        let full_key = format!("deck:{}", formatted_uuid);
         let full_data: Option<String> = con.get(&full_key).await.unwrap_or(None);
         
         match full_data {
