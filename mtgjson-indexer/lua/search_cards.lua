@@ -78,7 +78,7 @@ end
 -- Function to search by prefix matching
 local function search_by_prefix(search_term)
     local candidates = {}
-    local prefix_key = "prefix:" .. search_term:lower()
+    local prefix_key = "auto:prefix:" .. search_term:lower()
     local prefix_matches = redis.call('SMEMBERS', prefix_key)
     
     for _, uuid in ipairs(prefix_matches) do
@@ -218,19 +218,20 @@ local function apply_filters(card)
         if not card.is_promo then return false end
     end
     
-    -- Format legality filter
-    if filters.format then
-        local format_key = "legal:" .. filters.format:lower()
-        local legal_cards = redis.call('SMEMBERS', format_key)
-        local is_legal = false
-        for _, uuid in ipairs(legal_cards) do
-            if uuid == card.uuid then
-                is_legal = true
-                break
-            end
-        end
-        if not is_legal then return false end
-    end
+    -- Format legality filter (disabled - indexes not created by main.rs)
+    -- TODO: Add format legality indexes to main.rs if this functionality is needed
+    -- if filters.format then
+    --     local format_key = "legal:" .. filters.format:lower()
+    --     local legal_cards = redis.call('SMEMBERS', format_key)
+    --     local is_legal = false
+    --     for _, uuid in ipairs(legal_cards) do
+    --         if uuid == card.uuid then
+    --             is_legal = true
+    --             break
+    --         end
+    --     end
+    --     if not is_legal then return false end
+    -- end
     
     return true
 end

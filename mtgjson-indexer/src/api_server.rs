@@ -121,6 +121,28 @@ async fn autocomplete_cards(
     }
 }
 
+async fn fuzzy_search_cards(
+    Query(params): Query<SearchQuery>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let mut client = state.lock().await;
+    
+    match client.fuzzy_search_cards(&params.q, params.limit).await {
+        Ok(cards) => {
+            let response = SearchResponse {
+                query: params.q,
+                count: cards.len(),
+                results: cards,
+            };
+            Json(ApiResponse::ok(response)).into_response()
+        }
+        Err(e) => {
+            error!("Error performing fuzzy search: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::<()>::error(e.to_string()))).into_response()
+        }
+    }
+}
+
 async fn get_expensive_cards(
     Query(params): Query<ExpensiveQuery>,
     State(state): State<AppState>,
@@ -530,6 +552,7 @@ fn create_router(state: AppState) -> Router {
         // Card endpoints
         .route("/cards/:uuid", get(get_card))
         .route("/cards/search/name", get(search_cards))
+        .route("/cards/search/fuzzy", get(fuzzy_search_cards))
         .route("/cards/autocomplete", get(autocomplete_cards))
         .route("/cards/expensive", get(get_expensive_cards))
         
